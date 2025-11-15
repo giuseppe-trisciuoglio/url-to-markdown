@@ -20,12 +20,14 @@ import (
 
 func main() {
 	var verbose bool
+	var outputFile string
 	flag.BoolVar(&verbose, "v", false, "enable verbose logging")
+	flag.StringVar(&outputFile, "o", "", "output filename (default: auto-generated from URL)")
 	flag.Parse()
 
 	args := flag.Args()
 	if len(args) != 1 {
-		fmt.Fprintf(os.Stderr, "usage: %s [-v] <url>\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(os.Stderr, "usage: %s [-v] [-o <file>] <url>\n", filepath.Base(os.Args[0]))
 		os.Exit(2)
 	}
 	rawURL := args[0]
@@ -66,7 +68,12 @@ func main() {
 		markdown = string(body)
 	}
 
-	filename := outputFilename(parsed)
+	var filename string
+	if outputFile != "" {
+		filename = outputFile
+	} else {
+		filename = outputFilename(parsed)
+	}
 	logger("Saving to %s", filename)
 
 	if err := os.WriteFile(filename, []byte(markdown), 0644); err != nil {
