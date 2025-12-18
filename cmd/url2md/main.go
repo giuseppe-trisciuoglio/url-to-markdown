@@ -157,7 +157,13 @@ func fetchHTML(ctx context.Context, target *url.URL, logf func(string, ...interf
 		return nil, false, err
 	}
 
-	return data, true, nil
+	// Check if the content is already Markdown (skip HTML conversion)
+	contentType := resp.Header.Get("Content-Type")
+	isMarkdown := strings.HasSuffix(strings.ToLower(target.Path), ".md") ||
+		strings.Contains(contentType, "text/markdown") ||
+		strings.Contains(contentType, "text/x-markdown")
+
+	return data, !isMarkdown, nil
 }
 
 func convertToMarkdown(base *url.URL, html []byte) (string, error) {
