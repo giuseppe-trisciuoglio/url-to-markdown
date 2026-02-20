@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -13,7 +14,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/PuerkitoBio/goquery"
 
 	md "github.com/JohannesKaufmann/html-to-markdown"
 )
@@ -21,13 +25,17 @@ import (
 func main() {
 	var verbose bool
 	var outputFile string
+	var doCrawl bool
+	var maxPages int
 	flag.BoolVar(&verbose, "v", false, "enable verbose logging")
 	flag.StringVar(&outputFile, "o", "", "output filename (default: auto-generated from URL)")
+	flag.BoolVar(&doCrawl, "crawl", false, "crawl entire domain and save all pages to a folder")
+	flag.IntVar(&maxPages, "max", 100, "maximum pages to crawl (used with -crawl)")
 	flag.Parse()
 
 	args := flag.Args()
 	if len(args) != 1 {
-		fmt.Fprintf(os.Stderr, "usage: %s [-v] [-o <file>] <url>\n", filepath.Base(os.Args[0]))
+		fmt.Fprintf(os.Stderr, "usage: %s [-v] [-o <file>] [-crawl] [-max N] <url>\n", filepath.Base(os.Args[0]))
 		os.Exit(2)
 	}
 	rawURL := args[0]
@@ -43,6 +51,23 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "invalid url: %v\n", err)
 		os.Exit(2)
+	}
+
+	if doCrawl {
+		if outputFile != "" {
+			logger("warning: -o flag is ignored in crawl mode")
+		}
+		outDir := crawlDirName(parsed)
+		logger("Crawling %s → ./%s/", parsed.String(), outDir)
+		if err := os.MkdirAll(outDir, 0755); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to create output dir: %v\n", err)
+			os.Exit(1)
+		}
+		if err := crawlSite(parsed, outDir, maxPages, logger); err != nil {
+			fmt.Fprintf(os.Stderr, "crawl failed: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
@@ -188,6 +213,225 @@ func outputFilename(u *url.URL) string {
 	}
 
 	return base + ".md"
+}
+
+func crawlDirName(u *url.URL) string {
+	re := regexp.MustCompile(`[^A-Za-z0-9]+`)
+	name := re.ReplaceAllString(u.Host, "_")
+	return strings.Trim(name, "_")
+}
+
+func crawlFilePath(outDir string, pageURL *url.URL) string {
+	p := strings.Trim(pageURL.Path, "/")
+	if unescaped, err := url.PathUnescape(p); err == nil {
+		p = unescaped
+	}
+	if p == "" {
+		return filepath.Join(outDir, "index.md")
+	}
+	p = strings.ReplaceAll(p, "/", string(filepath.Separator))
+	if strings.HasSuffix(pageURL.Path, "/") {
+		p = filepath.Join(outDir, p, "index.md")
+	} else {
+		// Strip common extensions before adding .md
+		for _, ext := range []string{".html", ".htm", ".php", ".asp", ".aspx"} {
+			if strings.HasSuffix(strings.ToLower(p), ext) {
+				p = p[:len(p)-len(ext)]
+				break
+			}
+		}
+		p = filepath.Join(outDir, p+".md")
+	}
+	// Prevent path traversal: ensure result stays within outDir
+	absOut, err1 := filepath.Abs(outDir)
+	absFile, err2 := filepath.Abs(p)
+	if err1 != nil || err2 != nil || !strings.HasPrefix(absFile, absOut+string(filepath.Separator)) {
+		return ""
+	}
+	return p
+}
+
+func extractLinks(base *url.URL, htmlBytes []byte) []string {
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(htmlBytes))
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var links []string
+	doc.Find("a[href]").Each(func(_ int, s *goquery.Selection) {
+		href, _ := s.Attr("href")
+		href = strings.TrimSpace(href)
+		if href == "" || strings.HasPrefix(href, "#") ||
+			strings.HasPrefix(href, "mailto:") ||
+			strings.HasPrefix(href, "javascript:") {
+			return
+		}
+		ref, err := url.Parse(href)
+		if err != nil {
+			return
+		}
+		resolved := base.ResolveReference(ref)
+		resolved.Fragment = ""
+		// Strip query strings to avoid duplicate pages on doc sites
+		resolved.RawQuery = ""
+		key := resolved.String()
+		if !seen[key] {
+			seen[key] = true
+			links = append(links, key)
+		}
+	})
+	return links
+}
+
+type crawlResult struct {
+	pageURL  *url.URL
+	links    []string
+	markdown string
+	err      error
+}
+
+func crawlSite(startURL *url.URL, outDir string, maxPages int, logf func(string, ...interface{})) error {
+	const numWorkers = 3
+
+	visited := make(map[string]bool)
+	queue := []string{startURL.String()}
+	count := 0
+
+	// Channel for dispatching URLs to workers
+	jobs := make(chan string, numWorkers)
+	results := make(chan crawlResult, numWorkers)
+
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for rawURL := range jobs {
+				parsed, err := url.Parse(rawURL)
+				if err != nil {
+					results <- crawlResult{err: fmt.Errorf("invalid url %s: %w", rawURL, err)}
+					continue
+				}
+
+				ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+				body, isHTML, err := fetchHTML(ctx, parsed, logf)
+				cancel()
+				if err != nil {
+					results <- crawlResult{pageURL: parsed, err: err}
+					continue
+				}
+
+				var links []string
+				if isHTML {
+					links = extractLinks(parsed, body)
+				}
+
+				var markdown string
+				if isHTML {
+					markdown, err = convertToMarkdown(parsed, body)
+					if err != nil {
+						results <- crawlResult{pageURL: parsed, err: fmt.Errorf("conversion failed: %w", err)}
+						continue
+					}
+				} else {
+					markdown = string(body)
+				}
+
+				results <- crawlResult{
+					pageURL:  parsed,
+					links:    links,
+					markdown: markdown,
+				}
+			}
+		}()
+	}
+
+	// Dispatch work in batches
+	saved := 0
+	pending := 0
+	for count < maxPages {
+		// Fill worker slots from queue
+		for pending < numWorkers && len(queue) > 0 && count < maxPages {
+			current := queue[0]
+			queue = queue[1:]
+			if visited[current] {
+				continue
+			}
+			visited[current] = true
+			count++
+			logf("[%d/%d] Fetching %s", count, maxPages, current)
+			jobs <- current
+			pending++
+		}
+
+		if pending == 0 {
+			break
+		}
+
+		// Collect one result
+		res := <-results
+		pending--
+
+		if res.err != nil {
+			if res.pageURL != nil {
+				logf("  skipping %s: %v", res.pageURL.String(), res.err)
+			} else {
+				logf("  skipping: %v", res.err)
+			}
+			continue
+		}
+
+		// Save file
+		filePath := crawlFilePath(outDir, res.pageURL)
+		if filePath == "" {
+			logf("  skipping %s: unsafe path", res.pageURL.String())
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+			logf("  skipping %s: mkdir failed: %v", res.pageURL.String(), err)
+			continue
+		}
+		if err := os.WriteFile(filePath, []byte(res.markdown), 0644); err != nil {
+			logf("  skipping %s: write failed: %v", res.pageURL.String(), err)
+			continue
+		}
+		saved++
+
+		// Enqueue new links
+		for _, link := range res.links {
+			parsed, err := url.Parse(link)
+			if err != nil || parsed.Host != startURL.Host {
+				continue
+			}
+			if !visited[link] {
+				queue = append(queue, link)
+			}
+		}
+	}
+
+	close(jobs)
+	wg.Wait()
+	// Drain any remaining results
+	close(results)
+	for res := range results {
+		if res.err != nil {
+			continue
+		}
+		filePath := crawlFilePath(outDir, res.pageURL)
+		if filePath == "" {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+			continue
+		}
+		if err := os.WriteFile(filePath, []byte(res.markdown), 0644); err != nil {
+			continue
+		}
+		saved++
+	}
+
+	logf("Crawl complete. Saved %d/%d pages to ./%s/", saved, count, outDir)
+	return nil
 }
 
 func applyBrowserHeaders(req *http.Request, target *url.URL, includeNavigation bool) {
